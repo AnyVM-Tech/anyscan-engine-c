@@ -301,6 +301,17 @@ void *xdp_sender_thread(void *arg) {
     while (ctx->running && !stop_signal && ctx->work.current_global_idx < ctx->work.global_end_idx) {
         afxdp_drain_completion_ring(s);
 
+        /* Snapshot the work index at the START of this batch so we can roll
+         * back on TX-ring reservation failure (see the rollback comment near
+         * the bottom of this loop). The AF_PACKET path bails out of its inner
+         * loop *before* advancing tp_status, so its idx never out-runs the
+         * sent-packet count; the AF_XDP path processes a batch of indices
+         * speculatively so it must restore idx if the reservation never
+         * lands. Without this rollback, sustained TX backpressure would
+         * silently drop already-consumed targets — a deterministic
+         * scan-coverage gap. */
+        uint64_t idx_at_batch_start = ctx->work.current_global_idx;
+
         int built_count = 0;
         while (built_count < BATCH_SIZE && ctx->work.current_global_idx < ctx->work.global_end_idx && !stop_signal) {
             uint64_t index = blackrock_shuffle(&ctx->config->blackrock, ctx->work.current_global_idx);
@@ -328,7 +339,16 @@ void *xdp_sender_thread(void *arg) {
 
             uint32_t fid;
             if (afxdp_alloc_frame(s, &fid) != 0) {
-                /* All frames are in flight — break out, drain comp, kick. */
+                /* All frames are in flight — bail without "consuming" this
+                 * index. We already did current_global_idx++ for this
+                 * iteration above, so step it back by one so the next outer
+                 * iteration re-reads the same target. This mirrors the
+                 * AF_PACKET inner loop, which checks tp_status BEFORE
+                 * advancing tp_status / frame_idx and bails when the slot
+                 * is busy. The outer loop will drain the completion ring
+                 * and try again, at which point frames returned by the
+                 * kernel will be back on the free stack. */
+                ctx->work.current_global_idx--;
                 break;
             }
 
@@ -394,15 +414,25 @@ void *xdp_sender_thread(void *arg) {
                 atomic_fetch_add(&ctx->stats->packets_sent, built_count);
                 ctx->packets_sent += built_count;
             } else {
-                /* Could not reserve — return frames to the free stack so we
-                 * don't leak. The work indices have already been consumed
-                 * (by ctx->work.current_global_idx++ above) so those targets
-                 * are dropped; this is the same behaviour as the AF_PACKET
-                 * path under sustained ring-full pressure (it bails out of
-                 * the inner loop without sending). */
+                /* Reservation never landed within the retry budget. Return
+                 * the built frames to the free stack AND roll back
+                 * current_global_idx to where this batch started, so the
+                 * next outer iteration re-processes the same targets. The
+                 * BlackRock cipher is deterministic in current_global_idx,
+                 * so re-processing produces identical packets — only the
+                 * per-thread xorshift state for IP id / TCP seq is mutated,
+                 * which is fine (those fields are intended to be random).
+                 *
+                 * Without the rollback, a deterministic scan-coverage gap
+                 * appears under sustained TX backpressure (every batch that
+                 * hits the budget silently drops up to BATCH_SIZE targets).
+                 * The brief usleep gives the kernel a chance to drain
+                 * before we busy-spin the same indices again. */
                 for (int i = 0; i < built_count; i++) {
                     afxdp_free_frame(s, built_fids[i]);
                 }
+                ctx->work.current_global_idx = idx_at_batch_start;
+                if (!stop_signal) usleep(10);
             }
         }
 
