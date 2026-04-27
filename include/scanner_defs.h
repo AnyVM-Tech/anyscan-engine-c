@@ -50,6 +50,10 @@
 #define SCAN_METHOD_UDP 1
 #define SCAN_METHOD_ICMP_ECHO 2
 
+#define IO_ENGINE_AF_PACKET 0
+#define IO_ENGINE_PFRING_ZC 1
+#define IO_ENGINE_AF_XDP    2
+
 #define ETH_HDRLEN 14
 #define IP4_HDRLEN 20
 #define TCP_HDRLEN 20
@@ -101,6 +105,7 @@ typedef struct {
     int gateway_set;
     int scan_method;
     int original_scan_method;
+    int io_engine;
 #ifdef USE_PFRING_ZC
     pfring_zc_cluster *zc_cluster;
     pfring_zc_buffer_pool *zc_pool;

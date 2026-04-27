@@ -12,6 +12,30 @@ void *pfring_zc_receiver_thread(void *arg);
 #endif
 void rate_limit_batch(thread_context_t *ctx, int batch_size);
 
+/* I/O engine vtable: dispatch sender/receiver thread bodies and per-thread
+ * socket setup based on the runtime --io-engine config. AF_PACKET is the
+ * default and the unconditional fallback. PF_RING ZC and AF_XDP are opt-in
+ * at build time (USE_PFRING_ZC, USE_AF_XDP). */
+typedef struct {
+    const char *name;
+    int   (*init_per_thread)(thread_context_t *ctx, scanner_config_t *config);
+    void *(*tx_thread)(void *arg);
+    void *(*rx_thread)(void *arg);
+    void  (*teardown_per_thread)(thread_context_t *ctx);
+} io_engine_vtable_t;
+
+extern const io_engine_vtable_t io_engine_af_packet;
+#ifdef USE_PFRING_ZC
+extern const io_engine_vtable_t io_engine_pfring_zc;
+#endif
+#ifdef USE_AF_XDP
+extern const io_engine_vtable_t io_engine_af_xdp;
+#endif
+
+const io_engine_vtable_t *pick_io_engine(int io_engine);
+const char *io_engine_name(int io_engine);
+int io_engine_from_string(const char *name, int *out);
+
 void *receiver_thread(void *arg);
 void process_packet(const uint8_t *packet, int length, stats_t *stats, scanner_config_t *config, uint32_t src_ip);
 void init_writer(const char *filename);

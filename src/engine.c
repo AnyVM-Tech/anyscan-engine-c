@@ -31,7 +31,7 @@ void *status_thread(void *arg) {
         unsigned long long current_sent = atomic_load(&ctx->stats->packets_sent);
         unsigned long long current_recv = atomic_load(&ctx->stats->packets_received);
         unsigned long long hits = atomic_load(&ctx->stats->ports_open);
-        
+
         double pps_sent = since_last > 0 ? (double)(current_sent - last_sent) / since_last : 0;
         double pps_recv = since_last > 0 ? (double)(current_recv - last_recv) / since_last : 0;
         last_sent = current_sent;
@@ -39,7 +39,7 @@ void *status_thread(void *arg) {
         last_time = now;
         double percent = (ctx->stats->total_packets > 0) ? (double)current_sent / ctx->stats->total_packets * 100.0 : 0;
         double avg_pps_sent = elapsed > 0 ? (double)current_sent / elapsed : 0;
-        
+
         double hitrate = 0;
         if (current_sent > 0) {
             hitrate = (double)hits / current_sent * 100.0;
@@ -49,12 +49,115 @@ void *status_thread(void *arg) {
         format_zmap_rate(avg_pps_sent, s_avg_pps_sent);
         format_zmap_rate(pps_recv, s_pps_recv);
         if (!quiet_mode) {
-            fprintf(stderr, "\r%02d:%02d %d%%; send: %llu %s (%s avg); recv: %llu %s; hitrate: %.4f%%", 
+            fprintf(stderr, "\r%02d:%02d %d%%; send: %llu %s (%s avg); recv: %llu %s; hitrate: %.4f%%",
                     (int)elapsed/60, (int)elapsed%60, (int)percent, current_sent, s_pps_sent, s_avg_pps_sent, current_recv, s_pps_recv, hitrate);
             fflush(stderr);
         }
     }
     return NULL;
+}
+
+/* ---------- I/O engine dispatch -------------------------------------------
+ *
+ * Historically engine.c hardcoded `pthread_create(..., sender_thread, ...)`,
+ * leaving the PF_RING ZC code paths in src/{send,recv}-pfring.c compiled-but-
+ * unreachable. The vtable below resolves io_engine config (per --io-engine)
+ * to the right per-thread init + tx/rx thread bodies, and gives AF_XDP a slot
+ * to land into in Phase 2 PR 2 + 3.
+ *
+ * Phase 2 PR 1 of 4 ships the dispatch only:
+ *   - AF_PACKET (default): existing PF_PACKET socket setup + sender_thread/receiver_thread.
+ *   - PFRING_ZC: dispatches into pfring_zc_sender_thread/receiver_thread when
+ *     compiled with USE_PFRING_ZC=1 (dispatch bug fixed here, even though the
+ *     ZC cluster init itself is still owned by a follow-on PR).
+ *   - AF_XDP: stub — pick_io_engine returns NULL; run_scan errors at startup.
+ */
+
+static int af_packet_init_per_thread(thread_context_t *ctx, scanner_config_t *config) {
+    ctx->socket_fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (ctx->socket_fd < 0) {
+        fprintf(stderr, "[-] socket(PF_PACKET, SOCK_RAW) failed: %s\n", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_ll sll = { .sll_family = AF_PACKET, .sll_ifindex = config->ifindex, .sll_halen = ETH_ALEN };
+    memcpy(sll.sll_addr, config->dst_mac, ETH_ALEN);
+    if (bind(ctx->socket_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        fprintf(stderr, "[-] bind(AF_PACKET) failed: %s\n", strerror(errno));
+        close(ctx->socket_fd);
+        ctx->socket_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void af_packet_teardown_per_thread(thread_context_t *ctx) {
+    if (ctx->socket_fd >= 0) {
+        close(ctx->socket_fd);
+        ctx->socket_fd = -1;
+    }
+}
+
+const io_engine_vtable_t io_engine_af_packet = {
+    .name                = "af_packet",
+    .init_per_thread     = af_packet_init_per_thread,
+    .tx_thread           = sender_thread,
+    .rx_thread           = receiver_thread,
+    .teardown_per_thread = af_packet_teardown_per_thread,
+};
+
+#ifdef USE_PFRING_ZC
+/* Phase 2 PR 1 wires dispatch only. The PF_RING ZC cluster/pool/queue
+ * initialization (config->zc_cluster, config->zc_pool, ctx->zc_queue) is the
+ * responsibility of a follow-on patch — this function fails fast if the
+ * cluster has not been initialized so users get a clear error instead of a
+ * NULL deref inside pfring_zc_sender_thread. */
+static int pfring_zc_init_per_thread(thread_context_t *ctx, scanner_config_t *config) {
+    if (!config->zc_cluster || !config->zc_pool) {
+        fprintf(stderr, "[-] --io-engine=pfring_zc dispatch is wired, but the PF_RING ZC cluster has not been initialized.\n");
+        fprintf(stderr, "    Cluster/pool/queue setup is owned by a follow-on patch; for now use --io-engine=af_packet.\n");
+        return -1;
+    }
+    /* ctx->zc_queue is expected to be set by whatever opens the per-thread
+     * pfring_zc_open_device. Phase 2 PR 1 does not perform that step. */
+    return 0;
+}
+
+static void pfring_zc_teardown_per_thread(thread_context_t *ctx) {
+    (void)ctx; /* nothing to do at this stage */
+}
+
+const io_engine_vtable_t io_engine_pfring_zc = {
+    .name                = "pfring_zc",
+    .init_per_thread     = pfring_zc_init_per_thread,
+    .tx_thread           = pfring_zc_sender_thread,
+    .rx_thread           = pfring_zc_receiver_thread,
+    .teardown_per_thread = pfring_zc_teardown_per_thread,
+};
+#endif /* USE_PFRING_ZC */
+
+const io_engine_vtable_t *pick_io_engine(int io_engine) {
+    switch (io_engine) {
+        case IO_ENGINE_AF_PACKET:
+            return &io_engine_af_packet;
+        case IO_ENGINE_PFRING_ZC:
+#ifdef USE_PFRING_ZC
+            return &io_engine_pfring_zc;
+#else
+            fprintf(stderr, "[-] --io-engine=pfring_zc requested but binary was not built with USE_PFRING_ZC=1\n");
+            return NULL;
+#endif
+        case IO_ENGINE_AF_XDP:
+#ifdef USE_AF_XDP
+            return &io_engine_af_xdp;
+#else
+            fprintf(stderr, "[-] --io-engine=af_xdp requested but binary was not built with USE_AF_XDP=1\n");
+            fprintf(stderr, "    AF_XDP send/receive paths land in Phase 2 PR 2 + 3 of the AF_XDP plan (AnyScan PR #65). Use --io-engine=af_packet.\n");
+            return NULL;
+#endif
+        default:
+            fprintf(stderr, "[-] Unknown io_engine value: %d\n", io_engine);
+            return NULL;
+    }
 }
 
 void setup_scan(scanner_config_t *config) {
@@ -97,10 +200,16 @@ void setup_scan(scanner_config_t *config) {
         printf("[*] Destination (Gateway) MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
                config->dst_mac[0], config->dst_mac[1], config->dst_mac[2],
                config->dst_mac[3], config->dst_mac[4], config->dst_mac[5]);
+        printf("[*] I/O engine: %s\n", io_engine_name(config->io_engine));
     }
 }
 
 void run_scan(scanner_config_t *config) {
+    const io_engine_vtable_t *io = pick_io_engine(config->io_engine);
+    if (!io) {
+        exit(1);
+    }
+
     init_writer(config->output_file);
     pthread_t writer_tid;
     pthread_create(&writer_tid, NULL, writer_thread_func, NULL);
@@ -130,7 +239,7 @@ void run_scan(scanner_config_t *config) {
         total_packets = full_end - full_start;
     }
     blackrock_init(&config->blackrock, total_ips * total_ports, rand(), 4);
-    
+
     if (config->icmp_prescan) {
         alive_ips = calloc(1ULL << 29, 1);
         alive_queue = calloc(ALIVE_QUEUE_SIZE, sizeof(_Atomic uint32_t));
@@ -148,9 +257,9 @@ void run_scan(scanner_config_t *config) {
     stats.total_packets = total_packets;
     thread_context_t scan_ctx[MAX_THREADS];
     ip_per_thread(active_ranges, num_ranges, config->port_ranges, config->num_port_ranges, scan_ctx, config->senders, full_start, full_end);
-    
+
     pthread_t senders[MAX_THREADS], receivers[MAX_THREADS], alivers[8], status_tid;
-    
+
     for (int i = 0; i < config->senders; i++) {
         scan_ctx[i].thread_id = i;
         scan_ctx[i].config = config;
@@ -158,13 +267,16 @@ void run_scan(scanner_config_t *config) {
         scan_ctx[i].running = 1;
         scan_ctx[i].src_ip = config->source_ip_int;
         scan_ctx[i].src_port = 50000 + i;
-        scan_ctx[i].socket_fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        struct sockaddr_ll sll = { .sll_family = AF_PACKET, .sll_ifindex = config->ifindex, .sll_halen = ETH_ALEN };
-        memcpy(sll.sll_addr, config->dst_mac, ETH_ALEN);
-        bind(scan_ctx[i].socket_fd, (struct sockaddr *)&sll, sizeof(sll));
-        pthread_create(&senders[i], NULL, sender_thread, &scan_ctx[i]);
+        scan_ctx[i].socket_fd = -1;
+        if (io->init_per_thread(&scan_ctx[i], config) != 0) {
+            fprintf(stderr, "[-] %s init_per_thread failed for sender %d\n", io->name, i);
+            exit(1);
+        }
+        pthread_create(&senders[i], NULL, io->tx_thread, &scan_ctx[i]);
     }
 
+    /* ICMP prescan helpers always go via the legacy AF_PACKET socket — they
+     * predate io_engine and are independent of the chosen TX backend. */
     int num_alivers = config->icmp_prescan ? 4 : 0;
     thread_context_t alive_ctx[8];
     for (int i = 0; i < num_alivers; i++) {
@@ -180,7 +292,7 @@ void run_scan(scanner_config_t *config) {
         r_ctx[i] = scan_ctx[0];
         r_ctx[i].thread_id = i;
         r_ctx[i].running = 1;
-        pthread_create(&receivers[i], NULL, receiver_thread, &r_ctx[i]);
+        pthread_create(&receivers[i], NULL, io->rx_thread, &r_ctx[i]);
     }
 
     thread_context_t s_ctx = { .stats = &stats, .running = 1 };
@@ -188,12 +300,16 @@ void run_scan(scanner_config_t *config) {
 
     for (int i = 0; i < config->senders; i++) pthread_join(senders[i], NULL);
     atomic_store(&icmp_sender_done, 1);
-    
+
     for (int i = 0; i < num_alivers; i++) pthread_join(alivers[i], NULL);
-    
+
     for (int i = 0; i < config->cooldown_secs && !stop_signal; i++) sleep(1);
     for (int i = 0; i < config->receivers; i++) { r_ctx[i].running = 0; pthread_join(receivers[i], NULL); }
     s_ctx.running = 0; pthread_join(status_tid, NULL);
+
+    for (int i = 0; i < config->senders; i++) {
+        if (io->teardown_per_thread) io->teardown_per_thread(&scan_ctx[i]);
+    }
 
     if (config->icmp_prescan) {
         free(alive_queue); alive_queue = NULL;
