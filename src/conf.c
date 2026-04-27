@@ -22,8 +22,26 @@ static void usage() {
     printf("  -b, --blacklist-file=path Blacklist file for target IPs\n");
     printf("  -o, --output-file=path    Output file (defaults to stdout)\n");
     printf("  -q, --quiet               Quiet mode, don't print progress\n");
+    printf("  --io-engine=NAME          I/O engine: af_packet (default), pfring_zc, af_xdp\n");
     printf("\n");
     exit(0);
+}
+
+int io_engine_from_string(const char *name, int *out) {
+    if (!name || !out) return -1;
+    if (strcmp(name, "af_packet") == 0)  { *out = IO_ENGINE_AF_PACKET;  return 0; }
+    if (strcmp(name, "pfring_zc") == 0)  { *out = IO_ENGINE_PFRING_ZC;  return 0; }
+    if (strcmp(name, "af_xdp") == 0)     { *out = IO_ENGINE_AF_XDP;     return 0; }
+    return -1;
+}
+
+const char *io_engine_name(int io_engine) {
+    switch (io_engine) {
+        case IO_ENGINE_AF_PACKET: return "af_packet";
+        case IO_ENGINE_PFRING_ZC: return "pfring_zc";
+        case IO_ENGINE_AF_XDP:    return "af_xdp";
+        default:                  return "unknown";
+    }
 }
 
 void parse_probe_args(const char *arg, scanner_config_t *config) {
@@ -78,6 +96,7 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
     config->cooldown_secs = 5;
     config->rate_limit = DEFAULT_RATE;
     config->scan_method = SCAN_METHOD_SYN;
+    config->io_engine = IO_ENGINE_AF_PACKET;
     config->target_range = "0.0.0.0/0";
 
     static struct option long_options[] = {
@@ -100,6 +119,7 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
         {"target-range", required_argument, 0, 't'},
         {"icmp", no_argument, 0, 1003},
         {"probe-args", required_argument, 0, 1004},
+        {"io-engine", required_argument, 0, 1005},
         {0, 0, 0, 0}
     };
 
@@ -144,6 +164,28 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
             }
             case 1003: config->icmp_prescan = 1; break;
             case 1004: parse_probe_args(optarg, config); break;
+            case 1005: {
+                int eng = -1;
+                if (io_engine_from_string(optarg, &eng) != 0) {
+                    fprintf(stderr, "[-] Unknown --io-engine value '%s' (expected: af_packet, pfring_zc, af_xdp)\n", optarg);
+                    exit(1);
+                }
+#ifndef USE_PFRING_ZC
+                if (eng == IO_ENGINE_PFRING_ZC) {
+                    fprintf(stderr, "[-] --io-engine=pfring_zc requires the binary to be built with USE_PFRING_ZC=1\n");
+                    exit(1);
+                }
+#endif
+#ifndef USE_AF_XDP
+                if (eng == IO_ENGINE_AF_XDP) {
+                    fprintf(stderr, "[-] --io-engine=af_xdp requires the binary to be built with USE_AF_XDP=1\n");
+                    fprintf(stderr, "    AF_XDP send/receive paths land in Phase 2 PR 2 + 3 of the AF_XDP plan (AnyScan PR #65). Use --io-engine=af_packet.\n");
+                    exit(1);
+                }
+#endif
+                config->io_engine = eng;
+                break;
+            }
         }
     }
     if (optind < argc) {

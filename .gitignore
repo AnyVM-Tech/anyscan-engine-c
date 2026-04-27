@@ -1,0 +1,7 @@
+# Build artifacts
+src/*.o
+scanner
+
+# Editor / OS noise
+*.swp
+.DS_Store

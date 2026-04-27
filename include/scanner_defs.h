@@ -37,6 +37,14 @@
 #ifdef USE_PFRING_ZC
 #include <pfring_zc.h>
 #endif
+#ifdef USE_AF_XDP
+/* Forward decls only — full struct definitions live in src/send-afxdp.c
+ * (xdp_tx_state) and src/recv-afxdp.c (xdp_rx_state, lands in Phase 2 PR 3).
+ * Keeping them opaque means scanner_defs.h doesn't need to pull in
+ * <xdp/xsk.h>, which keeps build-time deps off the AF_PACKET-only path. */
+struct xdp_tx_state;
+struct xdp_rx_state;
+#endif
 #include "crypto-blackrock.h"
 
 #define MAX_PORTS 65535
@@ -49,6 +57,10 @@
 #define SCAN_METHOD_SYN 0
 #define SCAN_METHOD_UDP 1
 #define SCAN_METHOD_ICMP_ECHO 2
+
+#define IO_ENGINE_AF_PACKET 0
+#define IO_ENGINE_PFRING_ZC 1
+#define IO_ENGINE_AF_XDP    2
 
 #define ETH_HDRLEN 14
 #define IP4_HDRLEN 20
@@ -101,6 +113,7 @@ typedef struct {
     int gateway_set;
     int scan_method;
     int original_scan_method;
+    int io_engine;
 #ifdef USE_PFRING_ZC
     pfring_zc_cluster *zc_cluster;
     pfring_zc_buffer_pool *zc_pool;
@@ -149,6 +162,10 @@ typedef struct {
 #endif
 #ifdef USE_PFRING_ZC
     pfring_zc_queue *zc_queue;
+#endif
+#ifdef USE_AF_XDP
+    struct xdp_tx_state *xdp_tx;
+    struct xdp_rx_state *xdp_rx;
 #endif
     scanner_config_t *config;
     stats_t *stats;

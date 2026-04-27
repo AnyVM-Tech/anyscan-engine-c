@@ -24,6 +24,14 @@ $(TARGET): $(OBJS)
 clean:
 	rm -f $(OBJS) $(TARGET)
 
+# Smoke tests for the --io-engine dispatch (don't require root / raw sockets).
+# Verifies CLI parsing, error messages, and that the right path is reachable
+# for the current build flags. See tests/io_engine_dispatch.sh.
+test: $(TARGET)
+	tests/io_engine_dispatch.sh ./$(TARGET)
+
 install:
 	cp $(TARGET) /usr/bin/
 	chmod 777 /usr/bin/$(TARGET)
+
+.PHONY: all clean install test
