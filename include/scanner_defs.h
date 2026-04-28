@@ -45,6 +45,14 @@
  * AF_PACKET-only path. */
 struct xdp_tx_state;
 #endif
+#ifdef USE_DPDK
+/* Forward decl only — the full struct lives in src/send-dpdk.c. The DPDK
+ * receiver thread shares the per-thread state via the same pointer (it
+ * needs port_id + queue_id + the process-wide mbuf pool to do its RX-burst
+ * loop). Mirrors the AF_XDP forward-decl pattern; keeps the DPDK headers
+ * (rte_eal.h etc) off the AF_PACKET-only build. */
+struct dpdk_state;
+#endif
 #include "crypto-blackrock.h"
 
 #define MAX_PORTS 65535
@@ -61,6 +69,7 @@ struct xdp_tx_state;
 #define IO_ENGINE_AF_PACKET 0
 #define IO_ENGINE_PFRING_ZC 1
 #define IO_ENGINE_AF_XDP    2
+#define IO_ENGINE_DPDK      3
 
 #define ETH_HDRLEN 14
 #define IP4_HDRLEN 20
@@ -118,6 +127,18 @@ typedef struct {
     pfring_zc_cluster *zc_cluster;
     pfring_zc_buffer_pool *zc_pool;
 #endif
+#ifdef USE_DPDK
+    /* DPDK CLI knobs parsed in conf.c. dpdk_eal_args is the literal "everything
+     * after `--`" argv slice main.c hands to rte_eal_init; it is not parsed
+     * here. dpdk_port_id selects which DPDK port the scanner sends on (default
+     * 0 — the first vfio-pci-bound device). dpdk_num_{tx,rx}q default to the
+     * sender / receiver thread counts so DPDK queues 1:1-map to threads
+     * (queue_id == thread_id), matching the AF_XDP layout. */
+    int    dpdk_port_id;
+    int    dpdk_num_txq;
+    int    dpdk_num_rxq;
+    char  *dpdk_eal_args;
+#endif
     uint8_t *probe_payload;
     size_t probe_payload_len;
     struct BlackRock blackrock;
@@ -165,6 +186,13 @@ typedef struct {
 #endif
 #ifdef USE_AF_XDP
     struct xdp_tx_state *xdp_tx;
+#endif
+#ifdef USE_DPDK
+    /* Per-thread DPDK state — port id, queue id, mbuf pool ptr, and a
+     * per-thread template packet for fast packet-build. The receiver thread
+     * inherits the sender's state pointer (engine.c r_ctx[i] = scan_ctx[src])
+     * so RX queue_id matches the corresponding sender's TX queue_id. */
+    struct dpdk_state *dpdk;
 #endif
     scanner_config_t *config;
     stats_t *stats;

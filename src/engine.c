@@ -152,6 +152,24 @@ const io_engine_vtable_t io_engine_af_xdp = {
 };
 #endif /* USE_AF_XDP */
 
+#ifdef USE_DPDK
+/* DPDK userspace-networking I/O engine (Phase 2 of plans/2026-04-28-portscan
+ * -dpdk-impl-v1.md, §3.3). Vtable shape mirrors AF_XDP's; the heavy lifting
+ * (rte_eal_init, port configure, queue setup, mempool create) runs ONCE per
+ * process in dpdk_eal_bringup before run_scan is even called. By the time
+ * dpdk_init_per_thread fires the queues are already live and per-thread init
+ * just stashes the port_id / queue_id / mempool ptr. The RX thread reuses
+ * the sender's per-thread state pointer (engine.c:r_ctx[i] = scan_ctx[src])
+ * to find the matching queue. */
+const io_engine_vtable_t io_engine_dpdk = {
+    .name                = "dpdk",
+    .init_per_thread     = dpdk_init_per_thread,
+    .tx_thread           = dpdk_sender_thread,
+    .rx_thread           = dpdk_receiver_thread,
+    .teardown_per_thread = dpdk_teardown_per_thread,
+};
+#endif /* USE_DPDK */
+
 const io_engine_vtable_t *pick_io_engine(int io_engine) {
     switch (io_engine) {
         case IO_ENGINE_AF_PACKET:
@@ -169,6 +187,14 @@ const io_engine_vtable_t *pick_io_engine(int io_engine) {
 #else
             fprintf(stderr, "[-] --io-engine=af_xdp requested but binary was not built with USE_AF_XDP=1\n");
             fprintf(stderr, "    Rebuild with `make USE_AF_XDP=1` after installing libxdp-dev libbpf-dev libelf-dev. Use --io-engine=af_packet otherwise.\n");
+            return NULL;
+#endif
+        case IO_ENGINE_DPDK:
+#ifdef USE_DPDK
+            return &io_engine_dpdk;
+#else
+            fprintf(stderr, "[-] --io-engine=dpdk requested but binary was not built with USE_DPDK=1\n");
+            fprintf(stderr, "    Rebuild with `make USE_DPDK=1` after installing libdpdk-dev. DPDK additionally requires hugepages reserved and the target NIC bound to vfio-pci (see tools/setup-dpdk.sh in the AnyScan repo). Use --io-engine=af_packet or --io-engine=af_xdp otherwise.\n");
             return NULL;
 #endif
         default:

@@ -37,6 +37,31 @@ int                   afxdp_state_xsk_fd(const struct xdp_tx_state *s);
 uint32_t              afxdp_state_rx_frame_base(const struct xdp_tx_state *s);
 uint32_t              afxdp_state_rx_frame_count(const struct xdp_tx_state *s);
 #endif
+#ifdef USE_DPDK
+/* DPDK userspace-networking I/O path — implementations in src/send-dpdk.c,
+ * src/recv-dpdk.c, src/dpdk-eal.c.
+ *
+ * Concurrency / setup model differs from AF_XDP:
+ *   - rte_eal_init runs once per PROCESS (dpdk_eal_bringup) before any
+ *     setup_scan call. Without it no DPDK API is callable.
+ *   - mbuf pool, port configuration (rte_eth_dev_configure), and queue
+ *     setup (rte_eth_{tx,rx}_queue_setup, rte_eth_dev_start) are also
+ *     process-wide and live in dpdk_eal_bringup.
+ *   - Per-thread init (dpdk_init_per_thread) is just stashing port_id /
+ *     queue_id / mbuf-pool ptr and pinning the lcore — DPDK does the heavy
+ *     lifting up front so each thread can get straight into rte_eth_tx_burst.
+ *
+ * The io_engine_dpdk vtable in src/engine.c wires init_per_thread,
+ * tx_thread, rx_thread, teardown_per_thread into the dispatch switch so
+ * --io-engine=dpdk is accepted by pick_io_engine(). */
+int  dpdk_eal_bringup(scanner_config_t *config, int eal_argc, char **eal_argv);
+void dpdk_eal_teardown(void);
+
+int   dpdk_init_per_thread(thread_context_t *ctx, scanner_config_t *config);
+void  dpdk_teardown_per_thread(thread_context_t *ctx);
+void *dpdk_sender_thread(void *arg);
+void *dpdk_receiver_thread(void *arg);
+#endif
 void rate_limit_batch(thread_context_t *ctx, int batch_size);
 
 /* I/O engine vtable: dispatch sender/receiver thread bodies and per-thread
@@ -57,6 +82,9 @@ extern const io_engine_vtable_t io_engine_pfring_zc;
 #endif
 #ifdef USE_AF_XDP
 extern const io_engine_vtable_t io_engine_af_xdp;
+#endif
+#ifdef USE_DPDK
+extern const io_engine_vtable_t io_engine_dpdk;
 #endif
 
 const io_engine_vtable_t *pick_io_engine(int io_engine);

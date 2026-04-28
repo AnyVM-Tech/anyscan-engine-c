@@ -44,6 +44,43 @@ ifeq ($(USE_AF_XDP),1)
     SRCS += src/send-afxdp.c src/recv-afxdp.c
 endif
 
+# DPDK userspace-networking I/O engine — Phase 2 of the DPDK integration plan
+# (AnyVM-Tech/AnyScan plans/2026-04-28-portscan-dpdk-impl-v1.md, §3.9).
+#
+# `make USE_DPDK=1` adds the DPDK send/recv/EAL translation units to the
+# build, defines USE_DPDK so the io_engine_dpdk vtable is registered in
+# engine.c, and links librte_eal + librte_ethdev + librte_mbuf + librte_mempool
+# + librte_net + librte_net_ena via pkg-config. Default build (USE_DPDK unset)
+# is bit-for-bit identical to upstream — the DPDK source files are wrapped in
+# `#ifdef USE_DPDK` so they compile to nothing when the flag is off, and the
+# vtable registration in engine.c degrades to a "rebuild with USE_DPDK=1"
+# error message if the operator passes --io-engine=dpdk at runtime.
+#
+# pkg-config is the supported configuration source for libdpdk flags (libdpdk.pc
+# is shipped by libdpdk-dev on Debian/Ubuntu and by `make install` in source
+# builds). We do NOT fall back to explicit -l flags because DPDK's library
+# names embed version numbers and the explicit form is not portable across
+# distros. If pkg-config is missing or libdpdk.pc isn't on PKG_CONFIG_PATH the
+# build fails loudly, which is the right escalation: the operator needs to
+# install libdpdk-dev (or set PKG_CONFIG_PATH for a source build) before
+# USE_DPDK=1 can succeed.
+#
+# DPDK + AF_XDP coexistence: `make USE_DPDK=1 USE_AF_XDP=1` produces a binary
+# that supports both engines. They cannot coexist on the same NIC at the same
+# time (vfio-pci unbinds the kernel ENA driver) but the binary can choose at
+# runtime via --io-engine.
+ifeq ($(USE_DPDK),1)
+    CFLAGS += -DUSE_DPDK
+    DPDK_PKG_CFLAGS := $(shell pkg-config --cflags libdpdk 2>/dev/null)
+    DPDK_PKG_LIBS   := $(shell pkg-config --libs   libdpdk 2>/dev/null)
+    ifeq ($(strip $(DPDK_PKG_LIBS)),)
+        $(error libdpdk pkg-config not found — install libdpdk-dev or build DPDK with --prefix and set PKG_CONFIG_PATH)
+    endif
+    CFLAGS  += $(DPDK_PKG_CFLAGS)
+    LDFLAGS += $(DPDK_PKG_LIBS)
+    SRCS += src/send-dpdk.c src/recv-dpdk.c src/dpdk-eal.c
+endif
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
@@ -57,9 +94,14 @@ clean:
 
 # Smoke tests for the --io-engine dispatch (don't require root / raw sockets).
 # Verifies CLI parsing, error messages, and that the right path is reachable
-# for the current build flags. See tests/io_engine_dispatch.sh.
+# for the current build flags. The dpdk_dispatch.sh case is run too: on
+# default builds it asserts the parse-time rejection of --io-engine=dpdk; on
+# USE_DPDK=1 builds it asserts dispatch reachability + the DPDK CLI flag
+# surface. Both run unconditionally so we catch dispatch regressions in
+# either direction.
 test: $(TARGET)
 	tests/io_engine_dispatch.sh ./$(TARGET)
+	tests/dpdk_dispatch.sh ./$(TARGET)
 
 install:
 	cp $(TARGET) /usr/bin/
