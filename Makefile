@@ -78,7 +78,7 @@ ifeq ($(USE_DPDK),1)
     endif
     CFLAGS  += $(DPDK_PKG_CFLAGS)
     LDFLAGS += $(DPDK_PKG_LIBS)
-    SRCS += src/send-dpdk.c src/recv-dpdk.c src/dpdk-eal.c
+    SRCS += src/send-dpdk.c src/recv-dpdk.c src/dpdk-eal.c src/eal-argv-split.c src/dpdk-ring-clamp.c
 endif
 
 all: $(TARGET)
@@ -99,12 +99,20 @@ clean:
 # USE_DPDK=1 builds it asserts dispatch reachability + the DPDK CLI flag
 # surface. Both run unconditionally so we catch dispatch regressions in
 # either direction.
-test: $(TARGET)
+test: $(TARGET) unit-tests
 	tests/io_engine_dispatch.sh ./$(TARGET)
 	tests/dpdk_dispatch.sh ./$(TARGET)
+
+# Pure C unit tests for logic extracted from the scanner — argv splitter,
+# DPDK ring-size clamp, etc. These do not require libxdp / libdpdk to be
+# linked or hugepages reserved; they run on any host with a working C
+# compiler. Wired into the `test` target above so `make test` exercises
+# both the build-flag dispatch surface and the regression coverage.
+unit-tests:
+	tests/run_unit_tests.sh
 
 install:
 	cp $(TARGET) /usr/bin/
 	chmod 777 /usr/bin/$(TARGET)
 
-.PHONY: all clean install test
+.PHONY: all clean install test unit-tests

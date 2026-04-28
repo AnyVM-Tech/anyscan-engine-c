@@ -1,6 +1,7 @@
 # Build artifacts
 src/*.o
 scanner
+tests/build/
 
 # Editor / OS noise
 *.swp
