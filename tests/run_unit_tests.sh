@@ -59,6 +59,22 @@ if [ -f tests/test_dpdk_clamp.c ]; then
         tests/test_dpdk_clamp.c src/dpdk-ring-clamp.c
 fi
 
+# tests/test_afxdp_teardown.sh — structural assertions on the AF_XDP
+# bind-mode-ladder teardown path. Shell-based because the libxdp/libbpf
+# behaviour we need to assert about (per-attempt program detach + state
+# zeroing) requires a NIC + root to exercise. Verifies that the source
+# contains the four teardown primitives in the right place; a future
+# regression that removes any of them fails this test.
+if [ -f tests/test_afxdp_teardown.sh ]; then
+    if tests/test_afxdp_teardown.sh; then
+        PASS=$((PASS+1))
+    else
+        printf '  [fail] test_afxdp_teardown.sh: structural assertions failed\n' >&2
+        FAIL=$((FAIL+1))
+        FAIL_NAMES+=("test_afxdp_teardown")
+    fi
+fi
+
 printf '\n=== Unit-test results: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
     printf 'Failures:\n'

@@ -65,8 +65,11 @@
 #include "../include/xdp-defs.h"
 
 #include <xdp/xsk.h>
+#include <bpf/libbpf.h>      /* bpf_xdp_detach — needed by the bind-ladder
+                                teardown (anygpt-52 fall-back segfault fix). */
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
+#include <net/if.h>          /* if_nametoindex — needed by bpf_xdp_detach. */
 #include <sys/mman.h>
 #include <sys/socket.h>
 
@@ -220,7 +223,70 @@ static int afxdp_stock_fill_ring(struct xdp_tx_state *s) {
     return 0;
 }
 
+/* Tear down EVERYTHING libxdp may have set up before a failed
+ * xsk_socket__create returned. The bind-mode ladder
+ * (drv+zerocopy → drv+copy → skb) calls afxdp_try_bind again immediately
+ * after a failure, so leaving any state behind risks the next
+ * xsk_socket__create segfaulting inside libxdp's program-management
+ * layer with a "double-attached" interface or a partially initialised
+ * UMEM. This is the c6in.metal fall-back regression fix
+ * (PR 65 issuecomment-4339242358): on AWS ENA the ZEROCOPY attempt
+ * returns -EOPNOTSUPP from bind() *after* libxdp has already attached
+ * the xsks_map redirect program in DRV mode, and without this teardown
+ * the DRV+COPY attempt segfaults.
+ *
+ * Tears down (in order, each step gated on non-NULL/valid):
+ *   1. xsk_socket__delete       — releases the partially-bound socket.
+ *   2. xsk_umem__delete         — releases the UMEM ring metadata.
+ *   3. bpf_xdp_detach (mode=0)  — removes any XDP program libxdp left
+ *                                 attached to the interface, regardless
+ *                                 of attach mode (DRV or SKB).
+ *   4. free(free_stack), free(umem_area) — releases per-thread heap.
+ *   5. zeroes out s->{xsk,umem,xsk_fd,free_*,bound_mode,rings}    so the
+ *      next afxdp_try_bind iteration starts from a clean slate.
+ */
+static void afxdp_full_teardown_after_failed_bind(struct xdp_tx_state *s, const char *iface) {
+    if (s->xsk)        { xsk_socket__delete(s->xsk);  s->xsk  = NULL; }
+    if (s->umem)       { xsk_umem__delete(s->umem);   s->umem = NULL; }
+
+    if (iface && iface[0]) {
+        unsigned int ifindex = if_nametoindex(iface);
+        if (ifindex != 0) {
+            /* Pass mode=0 so bpf_xdp_detach removes whatever is attached
+             * regardless of how it was attached (DRV mode or SKB mode).
+             * Best-effort: the rc is intentionally ignored — if no
+             * program is attached, bpf_xdp_detach returns -ENOENT which
+             * is the desired no-op. */
+            (void)bpf_xdp_detach(ifindex, 0, NULL);
+        }
+    }
+
+    if (s->free_stack) { free(s->free_stack); s->free_stack = NULL; }
+    if (s->umem_area)  { free(s->umem_area);  s->umem_area  = NULL; }
+    s->xsk_fd     = -1;
+    s->free_top   = 0;
+    s->bound_mode = 0;
+    /* Zero ring metadata so the next attempt's xsk_*__create starts
+     * with a clean ring-prod / ring-cons state. The libxdp helpers
+     * memset these themselves on success but the failed attempt may
+     * have left partially-initialised values. */
+    memset(&s->fill, 0, sizeof(s->fill));
+    memset(&s->comp, 0, sizeof(s->comp));
+    memset(&s->tx,   0, sizeof(s->tx));
+    memset(&s->rx,   0, sizeof(s->rx));
+}
+
 static int afxdp_try_bind(struct xdp_tx_state *s, const char *iface, uint32_t queue_id, enum afxdp_bind_mode mode) {
+    /* Allocate a fresh UMEM for THIS attempt. The bind ladder
+     * (drv+zerocopy → drv+copy → skb) calls us up to 3 times; on AWS ENA
+     * the first attempt returns -EOPNOTSUPP for ZEROCOPY after libxdp
+     * has already attached an XDP redirect program in DRV mode. If we
+     * don't fully recreate UMEM + socket + program attachment per
+     * attempt, the next xsk_socket__create segfaults inside libxdp.
+     * Per-attempt reconstruction is the only teardown shape we can
+     * prove leaves no cross-attempt state. */
+    if (afxdp_alloc_umem(s) != 0) return -1;
+
     struct xsk_socket_config sc;
     memset(&sc, 0, sizeof(sc));
     sc.rx_size = ANYSCAN_AFXDP_RX_RING_SIZE;
@@ -255,6 +321,7 @@ static int afxdp_try_bind(struct xdp_tx_state *s, const char *iface, uint32_t qu
             fprintf(stderr, "[*] afxdp: xsk_socket__create(%s, q=%u, mode=%s) failed: %s\n",
                     iface, queue_id, afxdp_bind_mode_name(mode), strerror(-rc));
         }
+        afxdp_full_teardown_after_failed_bind(s, iface);
         return -1;
     }
     s->bound_mode = mode;
@@ -271,17 +338,19 @@ int afxdp_tx_init_per_thread(thread_context_t *ctx, scanner_config_t *config) {
     struct xdp_tx_state *s = calloc(1, sizeof(*s));
     if (!s) return -1;
 
-    if (afxdp_alloc_umem(s) != 0) {
-        free(s);
-        return -1;
-    }
-
     /* One XSK per (NIC, queue_id) — plan §3.4. queue_id = thread_id maps each
      * sender thread onto a different RSS/RX queue on the NIC. The ENA driver
      * supports zero-copy on lower-half channels only (plan §3.5); on
      * c6in.metal channel count is high enough that thread_id < N/2 in
      * practice. PR 3 / PR 4 add an ethtool channel-count probe to enforce
-     * the cap proactively; for now we attempt the bind and fall back. */
+     * the cap proactively; for now we attempt the bind and fall back.
+     *
+     * UMEM allocation now lives INSIDE afxdp_try_bind so each attempt
+     * recreates UMEM + socket + xdp_program from scratch. On a failed
+     * attempt the helper tears down everything (xsk_socket__delete,
+     * xsk_umem__delete, bpf_xdp_detach, free of heap, zero of state);
+     * the next attempt sees a fully clean slate. This is the c6in.metal
+     * fall-back segfault fix — see afxdp_full_teardown_after_failed_bind. */
     uint32_t queue_id = (uint32_t)ctx->thread_id;
 
     if (afxdp_try_bind(s, config->interface, queue_id, AFXDP_BIND_ZEROCOPY) != 0 &&
@@ -289,9 +358,8 @@ int afxdp_tx_init_per_thread(thread_context_t *ctx, scanner_config_t *config) {
         afxdp_try_bind(s, config->interface, queue_id, AFXDP_BIND_SKB) != 0) {
         fprintf(stderr, "[-] afxdp: bind ladder exhausted for %s queue %u — use --io-engine=af_packet\n",
                 config->interface, queue_id);
-        free(s->free_stack);
-        xsk_umem__delete(s->umem);
-        free(s->umem_area);
+        /* afxdp_try_bind has already torn down per-attempt state on each
+         * failure — only the outer struct itself remains to free here. */
         free(s);
         return -1;
     }
