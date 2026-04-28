@@ -116,6 +116,14 @@ if binary_has_af_xdp; then
             PASS=$((PASS+1))
             ;;
     esac
+
+    # Mismatched senders / receivers must fail fast — the AF_XDP receiver
+    # binds 1:1 to a sender's combined TX+RX XSK (SPSC ring constraint),
+    # so any other ratio produces silent drops or races.
+    XDP_MISMATCH_OUT=$("$SCANNER" --io-engine=af_xdp -p 80 -t 127.0.0.1/32 -T 2 -R 4 --quiet 2>&1 < /dev/null)
+    XDP_MISMATCH_RC=$?
+    assert_exit_eq "af_xdp -T 2 -R 4 exits 1 (mismatch guard)" 1 "$XDP_MISMATCH_RC"
+    assert_contains "af_xdp mismatch error names the constraint" "$XDP_MISMATCH_OUT" "requires --sender-threads == --receivers"
 else
     XDP_OUT=$("$SCANNER" --io-engine=af_xdp -p 80 2>&1)
     XDP_RC=$?

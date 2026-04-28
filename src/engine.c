@@ -227,6 +227,34 @@ void run_scan(scanner_config_t *config) {
         exit(1);
     }
 
+#ifdef USE_AF_XDP
+    /* AF_XDP wires each receiver thread to exactly one sender's combined
+     * TX+RX XSK (see src/recv-afxdp.c — the receiver reads ctx->xdp_tx and
+     * is the SOLE consumer of that XSK's RX ring + sole producer of its
+     * FILL ring). Asymmetric counts break this model:
+     *   - receivers < senders → some sender queues have no RX consumer,
+     *     replies on those queues land on the kernel's RX ring forever
+     *     (silent drops the user can't tell from "nothing matched").
+     *   - receivers > senders → multiple receivers wrap-mod onto the same
+     *     XSK and concurrently consume the same SPSC ring (races / drops
+     *     with no error reported).
+     * Refuse to start in either case. AF_PACKET / PF_RING ZC don't share
+     * this constraint because they don't share per-queue ring state. */
+    if (config->io_engine == IO_ENGINE_AF_XDP && config->senders != config->receivers) {
+        fprintf(stderr,
+                "[-] --io-engine=af_xdp requires --sender-threads == --receivers "
+                "(got senders=%d, receivers=%d).\n"
+                "    Each AF_XDP receiver thread consumes exactly one sender's "
+                "combined TX+RX XSK; mismatched counts either leave sender queues\n"
+                "    with no RX consumer (silent reply drops) or attach multiple "
+                "receivers to the same SPSC RX/FILL ring pair (races and drops).\n"
+                "    Pass matching counts (-T N -R N) or fall back to "
+                "--io-engine=af_packet which has no such constraint.\n",
+                config->senders, config->receivers);
+        exit(1);
+    }
+#endif
+
     init_writer(config->output_file);
     pthread_t writer_tid;
     pthread_create(&writer_tid, NULL, writer_thread_func, NULL);
