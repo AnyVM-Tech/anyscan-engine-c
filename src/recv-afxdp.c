@@ -122,7 +122,30 @@ void *xdp_receiver_thread(void *arg) {
     /* Per-batch scratch — at most RX_RING_SIZE addrs are recycled per peek. */
     uint64_t recycled_addrs[ANYSCAN_AFXDP_RX_RING_SIZE];
 
+    /* Pending FILL-ring queue. When FILL is full and refuses some recycled
+     * frame addrs, we MUST hold onto them — dropping them shrinks the
+     * usable RX buffer pool monotonically and ends in sustained packet
+     * loss (silent scan false negatives). The pending queue is bounded by
+     * the total number of RX-half frames in rotation, so a fixed array is
+     * safe; PR-review fix on top of an earlier "drop on the floor" bug. */
+    uint64_t pending[ANYSCAN_AFXDP_RX_FRAMES];
+    uint32_t pending_head  = 0;  /* next-read */
+    uint32_t pending_count = 0;
+
     while (ctx->running && !stop_signal) {
+        /* Always flush pending before doing new work — keeps the FILL ring
+         * topped up when the kernel makes room and bounds how long any
+         * single addr lingers off-ring. */
+        if (pending_count > 0) {
+            uint32_t flushed = afxdp_rx_fill_push(fill, &pending[pending_head], pending_count);
+            pending_head  += flushed;
+            pending_count -= flushed;
+            if (pending_count == 0) pending_head = 0;
+            else if (xsk_ring_prod__needs_wakeup(fill)) {
+                recvfrom(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, NULL);
+            }
+        }
+
         uint32_t rx_idx = 0;
         uint32_t rcvd = xsk_ring_cons__peek(rx, ANYSCAN_AFXDP_RX_RING_SIZE, &rx_idx);
         if (rcvd == 0) {
@@ -152,16 +175,46 @@ void *xdp_receiver_thread(void *arg) {
 
         xsk_ring_cons__release(rx, rcvd);
 
-        /* Recycle frames into the FILL ring. Under sustained back-pressure
-         * the FILL ring can refuse some — those frames temporarily drop out
-         * of rotation but the loop catches up once consumption resumes. */
+        /* Push as many recycled frames as FILL will accept; queue the rest
+         * in the pending buffer. Next iteration's flush retries them — the
+         * kernel makes FILL slots available as it consumes them for new
+         * incoming packets, so under transient back-pressure the queue
+         * drains naturally. The pending buffer cannot overflow because the
+         * total set of RX-half frames in rotation is bounded by
+         * ANYSCAN_AFXDP_RX_FRAMES (the partitioned half of the UMEM). */
         uint32_t refilled = afxdp_rx_fill_push(fill, recycled_addrs, rcvd);
-        if (refilled < rcvd && !quiet_mode) {
-            static _Atomic int warned = 0;
-            int w = atomic_fetch_add(&warned, 1);
-            if (w < 3) {
-                fprintf(stderr, "[!] afxdp-rx: recycled only %u/%u frames into FILL ring (back-pressure)\n",
-                        refilled, rcvd);
+        if (refilled < rcvd) {
+            uint32_t leftover = rcvd - refilled;
+            /* Compact pending if needed — head-based pointer means we may
+             * have unused slack at the front from earlier flushes. */
+            if (pending_head + pending_count + leftover > ANYSCAN_AFXDP_RX_FRAMES && pending_head > 0) {
+                memmove(pending, &pending[pending_head], pending_count * sizeof(uint64_t));
+                pending_head = 0;
+            }
+            /* Defensive: if even after compaction we don't fit, the
+             * partitioning invariant is broken. Log loudly and bail rather
+             * than corrupting memory. */
+            if (pending_head + pending_count + leftover > ANYSCAN_AFXDP_RX_FRAMES) {
+                fprintf(stderr, "[-] afxdp-rx: pending queue overflow (%u + %u > %u) — "
+                                "partitioning invariant violated, scan aborting.\n",
+                        pending_count, leftover, ANYSCAN_AFXDP_RX_FRAMES);
+                atomic_store(&fatal_error, 1);
+                stop_signal = 1;
+                return NULL;
+            }
+            memcpy(&pending[pending_head + pending_count],
+                   &recycled_addrs[refilled],
+                   leftover * sizeof(uint64_t));
+            pending_count += leftover;
+
+            if (!quiet_mode) {
+                static _Atomic int warned = 0;
+                int w = atomic_fetch_add(&warned, 1);
+                if (w < 3) {
+                    fprintf(stderr, "[!] afxdp-rx: deferred %u/%u frames into pending queue "
+                                    "(FILL back-pressure, depth=%u)\n",
+                            leftover, rcvd, pending_count);
+                }
             }
         }
 
