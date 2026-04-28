@@ -12,12 +12,13 @@ void *pfring_zc_receiver_thread(void *arg);
 #endif
 #ifdef USE_AF_XDP
 /* AF_XDP TX path — implementations in src/send-afxdp.c (Phase 2 PR 2).
- * The matching io_engine_af_xdp vtable struct is registered in src/engine.c
- * once the RX path lands in Phase 2 PR 3 (recv-afxdp.c). Until then,
- * --io-engine=af_xdp is rejected by pick_io_engine() with a clear error. */
+ * AF_XDP RX path — implementations in src/recv-afxdp.c (Phase 2 PR 3).
+ * The io_engine_af_xdp vtable in src/engine.c wires both into the dispatch
+ * switch so --io-engine=af_xdp is accepted by pick_io_engine(). */
 int   afxdp_tx_init_per_thread(thread_context_t *ctx, scanner_config_t *config);
 void  afxdp_tx_teardown_per_thread(thread_context_t *ctx);
 void *xdp_sender_thread(void *arg);
+void *xdp_receiver_thread(void *arg);
 #endif
 void rate_limit_batch(thread_context_t *ctx, int batch_size);
 

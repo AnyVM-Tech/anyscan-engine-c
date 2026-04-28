@@ -179,7 +179,7 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
 #ifndef USE_AF_XDP
                 if (eng == IO_ENGINE_AF_XDP) {
                     fprintf(stderr, "[-] --io-engine=af_xdp requires the binary to be built with USE_AF_XDP=1\n");
-                    fprintf(stderr, "    AF_XDP send/receive paths land in Phase 2 PR 2 + 3 of the AF_XDP plan (AnyScan PR #65). Use --io-engine=af_packet.\n");
+                    fprintf(stderr, "    Rebuild with `make USE_AF_XDP=1` after installing libxdp-dev libbpf-dev libelf-dev. Use --io-engine=af_packet otherwise.\n");
                     exit(1);
                 }
 #endif

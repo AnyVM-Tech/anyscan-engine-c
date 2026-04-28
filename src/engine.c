@@ -135,6 +135,23 @@ const io_engine_vtable_t io_engine_pfring_zc = {
 };
 #endif /* USE_PFRING_ZC */
 
+#ifdef USE_AF_XDP
+/* The AF_XDP TX side has paired init/teardown via the vtable hooks because
+ * engine.c::run_scan calls io->init_per_thread / io->teardown_per_thread
+ * once per sender slot. The RX side's setup happens INSIDE
+ * xdp_receiver_thread (mirroring how AF_PACKET's receiver_thread opens its
+ * own raw socket inside the thread) — engine.c never explicitly inits /
+ * tears down receivers, so binding RX setup into the thread body is the
+ * correct shape, not a workaround. */
+const io_engine_vtable_t io_engine_af_xdp = {
+    .name                = "af_xdp",
+    .init_per_thread     = afxdp_tx_init_per_thread,
+    .tx_thread           = xdp_sender_thread,
+    .rx_thread           = xdp_receiver_thread,
+    .teardown_per_thread = afxdp_tx_teardown_per_thread,
+};
+#endif /* USE_AF_XDP */
+
 const io_engine_vtable_t *pick_io_engine(int io_engine) {
     switch (io_engine) {
         case IO_ENGINE_AF_PACKET:
@@ -151,7 +168,7 @@ const io_engine_vtable_t *pick_io_engine(int io_engine) {
             return &io_engine_af_xdp;
 #else
             fprintf(stderr, "[-] --io-engine=af_xdp requested but binary was not built with USE_AF_XDP=1\n");
-            fprintf(stderr, "    AF_XDP send/receive paths land in Phase 2 PR 2 + 3 of the AF_XDP plan (AnyScan PR #65). Use --io-engine=af_packet.\n");
+            fprintf(stderr, "    Rebuild with `make USE_AF_XDP=1` after installing libxdp-dev libbpf-dev libelf-dev. Use --io-engine=af_packet otherwise.\n");
             return NULL;
 #endif
         default:
