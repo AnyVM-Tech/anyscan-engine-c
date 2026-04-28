@@ -11,13 +11,31 @@ void *pfring_zc_sender_thread(void *arg);
 void *pfring_zc_receiver_thread(void *arg);
 #endif
 #ifdef USE_AF_XDP
-/* AF_XDP TX path — implementations in src/send-afxdp.c (Phase 2 PR 2).
- * The matching io_engine_af_xdp vtable struct is registered in src/engine.c
- * once the RX path lands in Phase 2 PR 3 (recv-afxdp.c). Until then,
- * --io-engine=af_xdp is rejected by pick_io_engine() with a clear error. */
+/* AF_XDP combined TX+RX path — implementations in src/send-afxdp.c.
+ * The receiver thread (src/recv-afxdp.c) consumes the RX ring of the
+ * sender's XSK (one XSK per (NIC, queue), shared between sender + receiver)
+ * so reply packets RSS-hashed to the TX queue actually reach process_packet.
+ * The io_engine_af_xdp vtable in src/engine.c wires both into the dispatch
+ * switch so --io-engine=af_xdp is accepted by pick_io_engine(). */
+struct xdp_tx_state;
+struct xsk_ring_cons;
+struct xsk_ring_prod;
+
 int   afxdp_tx_init_per_thread(thread_context_t *ctx, scanner_config_t *config);
 void  afxdp_tx_teardown_per_thread(thread_context_t *ctx);
 void *xdp_sender_thread(void *arg);
+void *xdp_receiver_thread(void *arg);
+
+/* Receiver-side accessors into the sender's combined-mode XSK state.
+ * Defined in src/send-afxdp.c. The receiver is the sole owner of the RX
+ * consumer ring and the FILL producer ring; the sender owns TX/COMP. */
+struct xsk_ring_cons *afxdp_state_rx_ring(struct xdp_tx_state *s);
+struct xsk_ring_prod *afxdp_state_fill_ring(struct xdp_tx_state *s);
+void                 *afxdp_state_umem_base(const struct xdp_tx_state *s);
+uint32_t              afxdp_state_frame_size(const struct xdp_tx_state *s);
+int                   afxdp_state_xsk_fd(const struct xdp_tx_state *s);
+uint32_t              afxdp_state_rx_frame_base(const struct xdp_tx_state *s);
+uint32_t              afxdp_state_rx_frame_count(const struct xdp_tx_state *s);
 #endif
 void rate_limit_batch(thread_context_t *ctx, int batch_size);
 

@@ -38,12 +38,12 @@
 #include <pfring_zc.h>
 #endif
 #ifdef USE_AF_XDP
-/* Forward decls only — full struct definitions live in src/send-afxdp.c
- * (xdp_tx_state) and src/recv-afxdp.c (xdp_rx_state, lands in Phase 2 PR 3).
- * Keeping them opaque means scanner_defs.h doesn't need to pull in
- * <xdp/xsk.h>, which keeps build-time deps off the AF_PACKET-only path. */
+/* Forward decl only — the full struct lives in src/send-afxdp.c and the
+ * receiver consumes the same combined-mode XSK state via accessors
+ * declared in scanner.h. Keeping it opaque means scanner_defs.h doesn't
+ * need to pull in <xdp/xsk.h>, which keeps build-time deps off the
+ * AF_PACKET-only path. */
 struct xdp_tx_state;
-struct xdp_rx_state;
 #endif
 #include "crypto-blackrock.h"
 
@@ -165,7 +165,6 @@ typedef struct {
 #endif
 #ifdef USE_AF_XDP
     struct xdp_tx_state *xdp_tx;
-    struct xdp_rx_state *xdp_rx;
 #endif
     scanner_config_t *config;
     stats_t *stats;
@@ -200,6 +199,15 @@ extern _Atomic uint32_t *alive_queue;
 extern _Atomic uint64_t alive_queue_head;
 extern _Atomic uint64_t alive_queue_tail;
 extern _Atomic int icmp_sender_done;
+
+/* Set by any thread that hits a fatal initialization or steady-state error
+ * the orchestrator must surface (e.g. AF_XDP RX socket cannot bind / shared
+ * XSK is missing so replies would be silently lost). main() reads this and
+ * returns non-zero so the caller can distinguish "scan ran but found
+ * nothing" from "scan was misconfigured and produced no replies because the
+ * RX path was never wired up". Threads that set this should also set
+ * stop_signal so cooperating threads bail out promptly. */
+extern _Atomic int fatal_error;
 
 #define IS_IP_SEEN(ip) (seen_ips[(uint32_t)(ip) >> 3] & (1 << ((uint32_t)(ip) & 7)))
 #define MARK_IP_SEEN(ip) (seen_ips[(uint32_t)(ip) >> 3] |= (1 << ((uint32_t)(ip) & 7)))

@@ -9,8 +9,10 @@
 #   2. --io-engine=af_packet is accepted.
 #   3. --io-engine=pfring_zc errors cleanly when the binary is not built with
 #      USE_PFRING_ZC=1, OR is accepted (dispatch reachable) when it is.
-#   4. --io-engine=af_xdp errors at startup with a not-yet-implemented message
-#      (since USE_AF_XDP send/receive paths land in PRs 2 + 3 of Phase 2).
+#   4. --io-engine=af_xdp errors at startup with a clear "rebuild with
+#      USE_AF_XDP=1" message when the binary was not built with the flag.
+#      When the binary IS built with USE_AF_XDP=1, the dispatch is reachable
+#      and parse_arguments accepts it (the actual XSK bind happens later).
 #   5. Unknown engine names produce a clear error.
 #
 # Usage:
@@ -96,15 +98,38 @@ BOGUS_RC=$?
 assert_exit_eq "bogus engine exits 1" 1 "$BOGUS_RC"
 assert_contains "bogus engine error mentions Unknown" "$BOGUS_OUT" "Unknown --io-engine"
 
-printf '\n[3] --io-engine=af_xdp errors cleanly until PR 2 + 3 land\n'
+printf '\n[3] --io-engine=af_xdp behaviour matches build flag\n'
 if binary_has_af_xdp; then
-    printf '  [skip] binary built with USE_AF_XDP=1 — runtime path not exercised here\n'
+    # Built with USE_AF_XDP=1 — the dispatch is reachable. The scanner needs
+    # CAP_NET_RAW + CAP_BPF to actually open the XSK, so non-root runs will
+    # fail at bind time — but parse_arguments must NOT reject the engine
+    # name, and the error must NOT be the "rebuild with" message.
+    XDP_OUT=$("$SCANNER" --io-engine=af_xdp -p 80 -t 127.0.0.1/32 --quiet 2>&1 < /dev/null || true)
+    case "$XDP_OUT" in
+        *"Unknown --io-engine"*|*"requires the binary to be built with"*)
+            printf '  [fail] af_xdp rejected at parse time despite USE_AF_XDP build:\n%s\n' "$XDP_OUT" >&2
+            FAIL=$((FAIL+1))
+            FAIL_MSGS+=("af_xdp dispatch reachable")
+            ;;
+        *)
+            printf '  [ok]   af_xdp dispatch is reachable (USE_AF_XDP=1 build)\n'
+            PASS=$((PASS+1))
+            ;;
+    esac
+
+    # Mismatched senders / receivers must fail fast — the AF_XDP receiver
+    # binds 1:1 to a sender's combined TX+RX XSK (SPSC ring constraint),
+    # so any other ratio produces silent drops or races.
+    XDP_MISMATCH_OUT=$("$SCANNER" --io-engine=af_xdp -p 80 -t 127.0.0.1/32 -T 2 -R 4 --quiet 2>&1 < /dev/null)
+    XDP_MISMATCH_RC=$?
+    assert_exit_eq "af_xdp -T 2 -R 4 exits 1 (mismatch guard)" 1 "$XDP_MISMATCH_RC"
+    assert_contains "af_xdp mismatch error names the constraint" "$XDP_MISMATCH_OUT" "requires --sender-threads == --receivers"
 else
     XDP_OUT=$("$SCANNER" --io-engine=af_xdp -p 80 2>&1)
     XDP_RC=$?
     assert_exit_eq "af_xdp without USE_AF_XDP exits 1" 1 "$XDP_RC"
     assert_contains "af_xdp error names the build flag" "$XDP_OUT" "USE_AF_XDP=1"
-    assert_contains "af_xdp error points at Phase 2 PRs 2 + 3" "$XDP_OUT" "Phase 2 PR 2 + 3"
+    assert_contains "af_xdp error points users at the rebuild step" "$XDP_OUT" "Rebuild with"
 fi
 
 printf '\n[4] --io-engine=pfring_zc behaviour matches build flag\n'

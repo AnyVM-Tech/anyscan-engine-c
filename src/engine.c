@@ -135,6 +135,23 @@ const io_engine_vtable_t io_engine_pfring_zc = {
 };
 #endif /* USE_PFRING_ZC */
 
+#ifdef USE_AF_XDP
+/* The AF_XDP TX side has paired init/teardown via the vtable hooks because
+ * engine.c::run_scan calls io->init_per_thread / io->teardown_per_thread
+ * once per sender slot. The RX side's setup happens INSIDE
+ * xdp_receiver_thread (mirroring how AF_PACKET's receiver_thread opens its
+ * own raw socket inside the thread) — engine.c never explicitly inits /
+ * tears down receivers, so binding RX setup into the thread body is the
+ * correct shape, not a workaround. */
+const io_engine_vtable_t io_engine_af_xdp = {
+    .name                = "af_xdp",
+    .init_per_thread     = afxdp_tx_init_per_thread,
+    .tx_thread           = xdp_sender_thread,
+    .rx_thread           = xdp_receiver_thread,
+    .teardown_per_thread = afxdp_tx_teardown_per_thread,
+};
+#endif /* USE_AF_XDP */
+
 const io_engine_vtable_t *pick_io_engine(int io_engine) {
     switch (io_engine) {
         case IO_ENGINE_AF_PACKET:
@@ -151,7 +168,7 @@ const io_engine_vtable_t *pick_io_engine(int io_engine) {
             return &io_engine_af_xdp;
 #else
             fprintf(stderr, "[-] --io-engine=af_xdp requested but binary was not built with USE_AF_XDP=1\n");
-            fprintf(stderr, "    AF_XDP send/receive paths land in Phase 2 PR 2 + 3 of the AF_XDP plan (AnyScan PR #65). Use --io-engine=af_packet.\n");
+            fprintf(stderr, "    Rebuild with `make USE_AF_XDP=1` after installing libxdp-dev libbpf-dev libelf-dev. Use --io-engine=af_packet otherwise.\n");
             return NULL;
 #endif
         default:
@@ -209,6 +226,34 @@ void run_scan(scanner_config_t *config) {
     if (!io) {
         exit(1);
     }
+
+#ifdef USE_AF_XDP
+    /* AF_XDP wires each receiver thread to exactly one sender's combined
+     * TX+RX XSK (see src/recv-afxdp.c — the receiver reads ctx->xdp_tx and
+     * is the SOLE consumer of that XSK's RX ring + sole producer of its
+     * FILL ring). Asymmetric counts break this model:
+     *   - receivers < senders → some sender queues have no RX consumer,
+     *     replies on those queues land on the kernel's RX ring forever
+     *     (silent drops the user can't tell from "nothing matched").
+     *   - receivers > senders → multiple receivers wrap-mod onto the same
+     *     XSK and concurrently consume the same SPSC ring (races / drops
+     *     with no error reported).
+     * Refuse to start in either case. AF_PACKET / PF_RING ZC don't share
+     * this constraint because they don't share per-queue ring state. */
+    if (config->io_engine == IO_ENGINE_AF_XDP && config->senders != config->receivers) {
+        fprintf(stderr,
+                "[-] --io-engine=af_xdp requires --sender-threads == --receivers "
+                "(got senders=%d, receivers=%d).\n"
+                "    Each AF_XDP receiver thread consumes exactly one sender's "
+                "combined TX+RX XSK; mismatched counts either leave sender queues\n"
+                "    with no RX consumer (silent reply drops) or attach multiple "
+                "receivers to the same SPSC RX/FILL ring pair (races and drops).\n"
+                "    Pass matching counts (-T N -R N) or fall back to "
+                "--io-engine=af_packet which has no such constraint.\n",
+                config->senders, config->receivers);
+        exit(1);
+    }
+#endif
 
     init_writer(config->output_file);
     pthread_t writer_tid;
@@ -289,7 +334,16 @@ void run_scan(scanner_config_t *config) {
 
     thread_context_t r_ctx[MAX_THREADS];
     for (int i = 0; i < config->receivers; i++) {
-        r_ctx[i] = scan_ctx[0];
+        /* Inherit per-thread state from the corresponding sender so the AF_XDP
+         * receiver can reach the matching sender's combined TX+RX XSK
+         * (xdp_receiver_thread reads ctx->xdp_tx). When receivers > senders,
+         * extra receivers wrap around and double up on existing XSKs — that's
+         * benign for AF_PACKET (opens its own raw socket), and for AF_XDP the
+         * RX ring is SPSC so it's the user's responsibility to size receivers
+         * <= senders. AF_PACKET ignores ctx->xdp_tx; PF_RING ZC's per-thread
+         * zc_queue now correctly belongs to its source sender too. */
+        int src = (config->senders > 0) ? (i % config->senders) : 0;
+        r_ctx[i] = scan_ctx[src];
         r_ctx[i].thread_id = i;
         r_ctx[i].running = 1;
         pthread_create(&receivers[i], NULL, io->rx_thread, &r_ctx[i]);
