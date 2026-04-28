@@ -30,6 +30,24 @@
 #define ANYSCAN_AFXDP_FILL_RING_SIZE  2048u
 #define ANYSCAN_AFXDP_RX_RING_SIZE    2048u
 
+/* Frame partitioning for the combined TX+RX XSK (plan §3.4 / PR review).
+ *
+ * Each sender's XSK enables BOTH TX and RX rings on the same (NIC, queue)
+ * so reply traffic that RSS hashes back to that queue lands on the same
+ * socket the sender owns. The TX path and RX path don't share frames at
+ * runtime: the UMEM is split into two halves so the TX free-stack and the
+ * FILL ring never address the same frame index, which keeps the SPSC ring
+ * invariants intact (sender is sole producer of TX/consumer of COMP;
+ * receiver is sole consumer of RX/producer of FILL).
+ *
+ * Half/half is a heuristic, not a tuning lever — TX-side burst depth is
+ * bounded by TX_RING_SIZE + COMP_RING_SIZE, RX-side by RX_RING_SIZE +
+ * FILL_RING_SIZE, both ≤ NUM_FRAMES/2 = 4096. Live-bench may surface a
+ * better split; for now keep it symmetric. */
+#define ANYSCAN_AFXDP_TX_FRAMES       (ANYSCAN_AFXDP_NUM_FRAMES / 2u)
+#define ANYSCAN_AFXDP_RX_FRAMES       (ANYSCAN_AFXDP_NUM_FRAMES - ANYSCAN_AFXDP_TX_FRAMES)
+#define ANYSCAN_AFXDP_RX_FRAME_BASE   ANYSCAN_AFXDP_TX_FRAMES
+
 /* Bind-mode fallback ladder (plan §4.3).
  *
  * On bind, libxdp attempts the requested xdp_flags / bind_flags combo against

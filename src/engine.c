@@ -306,7 +306,16 @@ void run_scan(scanner_config_t *config) {
 
     thread_context_t r_ctx[MAX_THREADS];
     for (int i = 0; i < config->receivers; i++) {
-        r_ctx[i] = scan_ctx[0];
+        /* Inherit per-thread state from the corresponding sender so the AF_XDP
+         * receiver can reach the matching sender's combined TX+RX XSK
+         * (xdp_receiver_thread reads ctx->xdp_tx). When receivers > senders,
+         * extra receivers wrap around and double up on existing XSKs — that's
+         * benign for AF_PACKET (opens its own raw socket), and for AF_XDP the
+         * RX ring is SPSC so it's the user's responsibility to size receivers
+         * <= senders. AF_PACKET ignores ctx->xdp_tx; PF_RING ZC's per-thread
+         * zc_queue now correctly belongs to its source sender too. */
+        int src = (config->senders > 0) ? (i % config->senders) : 0;
+        r_ctx[i] = scan_ctx[src];
         r_ctx[i].thread_id = i;
         r_ctx[i].running = 1;
         pthread_create(&receivers[i], NULL, io->rx_thread, &r_ctx[i]);
