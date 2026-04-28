@@ -13,6 +13,37 @@ ifeq ($(USE_PFRING_ZC),1)
     SRCS += src/send-pfring.c src/recv-pfring.c
 endif
 
+# AF_XDP (XSK) I/O engine — Phase 2 PR C of the AF_XDP integration plan
+# (AnyVM-Tech/AnyScan plans/2026-04-27-portscan-afxdp-plan-v1.md, §3.6).
+#
+# `make USE_AF_XDP=1` adds the AF_XDP send/receive translation units to the
+# build, defines USE_AF_XDP so the io_engine_af_xdp vtable is registered in
+# engine.c, and links libxdp + libbpf + libelf. Default build (USE_AF_XDP
+# unset) is bit-for-bit identical to upstream — the AF_XDP source files are
+# wrapped in `#ifdef USE_AF_XDP` so they compile to nothing when the flag is
+# off, and the vtable registration in engine.c degrades to AF_PACKET-only
+# dispatch with a one-line "rebuild with USE_AF_XDP=1" error message if the
+# operator passes --io-engine=af_xdp at runtime.
+#
+# pkg-config is the supported configuration source for libxdp/libbpf flags
+# (libxdp.pc and libbpf.pc are shipped by the -dev packages on Debian/Ubuntu).
+# We fall back to explicit -l flags when pkg-config is unavailable so the
+# Makefile still works on hosts where libxdp/libbpf were source-built without
+# .pc files. -lelf is appended unconditionally because libxdp transitively
+# requires it for ELF section walking and pkg-config sometimes does not pull
+# it through depending on how libxdp.pc is generated.
+ifeq ($(USE_AF_XDP),1)
+    CFLAGS += -DUSE_AF_XDP
+    AFXDP_PKG_CFLAGS := $(shell pkg-config --cflags libxdp libbpf 2>/dev/null)
+    AFXDP_PKG_LIBS   := $(shell pkg-config --libs   libxdp libbpf 2>/dev/null)
+    ifeq ($(strip $(AFXDP_PKG_LIBS)),)
+        AFXDP_PKG_LIBS := -lxdp -lbpf
+    endif
+    CFLAGS  += $(AFXDP_PKG_CFLAGS)
+    LDFLAGS += $(AFXDP_PKG_LIBS) -lelf -lz
+    SRCS += src/send-afxdp.c src/recv-afxdp.c
+endif
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
