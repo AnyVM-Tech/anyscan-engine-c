@@ -22,7 +22,12 @@ static void usage() {
     printf("  -b, --blacklist-file=path Blacklist file for target IPs\n");
     printf("  -o, --output-file=path    Output file (defaults to stdout)\n");
     printf("  -q, --quiet               Quiet mode, don't print progress\n");
-    printf("  --io-engine=NAME          I/O engine: af_packet (default), pfring_zc, af_xdp\n");
+    printf("  --io-engine=NAME          I/O engine: af_packet (default), pfring_zc, af_xdp, dpdk\n");
+    printf("  --dpdk-port=N             DPDK port id (default 0; ignored unless --io-engine=dpdk)\n");
+    printf("  --dpdk-num-txq=N          DPDK TX queue count (default = sender thread count)\n");
+    printf("  --dpdk-num-rxq=N          DPDK RX queue count (default = receiver thread count)\n");
+    printf("  --dpdk-eal-args='ARGS'    Extra raw EAL args. Alternative form: pass them after `--`\n");
+    printf("                            on the command line, e.g. `scanner --io-engine=dpdk -- -l 0-7 --socket-mem 1024`\n");
     printf("\n");
     exit(0);
 }
@@ -32,6 +37,7 @@ int io_engine_from_string(const char *name, int *out) {
     if (strcmp(name, "af_packet") == 0)  { *out = IO_ENGINE_AF_PACKET;  return 0; }
     if (strcmp(name, "pfring_zc") == 0)  { *out = IO_ENGINE_PFRING_ZC;  return 0; }
     if (strcmp(name, "af_xdp") == 0)     { *out = IO_ENGINE_AF_XDP;     return 0; }
+    if (strcmp(name, "dpdk") == 0)       { *out = IO_ENGINE_DPDK;       return 0; }
     return -1;
 }
 
@@ -40,6 +46,7 @@ const char *io_engine_name(int io_engine) {
         case IO_ENGINE_AF_PACKET: return "af_packet";
         case IO_ENGINE_PFRING_ZC: return "pfring_zc";
         case IO_ENGINE_AF_XDP:    return "af_xdp";
+        case IO_ENGINE_DPDK:      return "dpdk";
         default:                  return "unknown";
     }
 }
@@ -98,6 +105,16 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
     config->scan_method = SCAN_METHOD_SYN;
     config->io_engine = IO_ENGINE_AF_PACKET;
     config->target_range = "0.0.0.0/0";
+#ifdef USE_DPDK
+    /* Defaults align with the AF_XDP layout: queue_id == thread_id, port 0
+     * (the conventional first vfio-pci-bound device), and -1 sentinels mean
+     * "fall through to the senders/receivers count" so dpdk_eal_bringup picks
+     * matching queue counts without the operator having to specify them. */
+    config->dpdk_port_id  = 0;
+    config->dpdk_num_txq  = -1;
+    config->dpdk_num_rxq  = -1;
+    config->dpdk_eal_args = NULL;
+#endif
 
     static struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
@@ -120,6 +137,10 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
         {"icmp", no_argument, 0, 1003},
         {"probe-args", required_argument, 0, 1004},
         {"io-engine", required_argument, 0, 1005},
+        {"dpdk-port", required_argument, 0, 1006},
+        {"dpdk-num-txq", required_argument, 0, 1007},
+        {"dpdk-num-rxq", required_argument, 0, 1008},
+        {"dpdk-eal-args", required_argument, 0, 1009},
         {0, 0, 0, 0}
     };
 
@@ -167,7 +188,7 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
             case 1005: {
                 int eng = -1;
                 if (io_engine_from_string(optarg, &eng) != 0) {
-                    fprintf(stderr, "[-] Unknown --io-engine value '%s' (expected: af_packet, pfring_zc, af_xdp)\n", optarg);
+                    fprintf(stderr, "[-] Unknown --io-engine value '%s' (expected: af_packet, pfring_zc, af_xdp, dpdk)\n", optarg);
                     exit(1);
                 }
 #ifndef USE_PFRING_ZC
@@ -183,11 +204,44 @@ void parse_arguments(int argc, char **argv, scanner_config_t *config) {
                     exit(1);
                 }
 #endif
+#ifndef USE_DPDK
+                if (eng == IO_ENGINE_DPDK) {
+                    fprintf(stderr, "[-] --io-engine=dpdk requires the binary to be built with USE_DPDK=1\n");
+                    fprintf(stderr, "    Rebuild with `make USE_DPDK=1` after installing libdpdk-dev. DPDK additionally requires hugepages reserved and the target NIC bound to vfio-pci (see tools/setup-dpdk.sh in the AnyScan repo). Use --io-engine=af_packet or --io-engine=af_xdp otherwise.\n");
+                    exit(1);
+                }
+#endif
                 config->io_engine = eng;
                 break;
             }
+#ifdef USE_DPDK
+            case 1006: config->dpdk_port_id  = atoi(optarg); break;
+            case 1007: config->dpdk_num_txq  = atoi(optarg); break;
+            case 1008: config->dpdk_num_rxq  = atoi(optarg); break;
+            case 1009: config->dpdk_eal_args = strdup(optarg); break;
+#else
+            /* Recognize the DPDK CLI flags so the parse does not fall through
+             * to the default getopt error path on a non-DPDK build, but make
+             * the rejection explicit and consistent with --io-engine=dpdk. */
+            case 1006: case 1007: case 1008: case 1009:
+                fprintf(stderr, "[-] DPDK CLI flag requires the binary to be built with USE_DPDK=1\n");
+                exit(1);
+#endif
         }
     }
+#ifdef USE_DPDK
+    /* DPDK has no kernel ARP table; without --gateway-mac the scanner would
+     * emit packets with a zero / broadcast destination MAC and the gateway
+     * silently drops them. Refuse the configuration loudly so the failure
+     * mode is "scan does not start" not "scan reports zero replies". */
+    if (config->io_engine == IO_ENGINE_DPDK && !config->gateway_set) {
+        fprintf(stderr, "[-] --io-engine=dpdk requires --gateway-mac=AA:BB:CC:DD:EE:FF.\n");
+        fprintf(stderr, "    DPDK bypasses the kernel network stack so no ARP resolution happens; the\n");
+        fprintf(stderr, "    gateway MAC has to be supplied at the command line. Resolve it with\n");
+        fprintf(stderr, "    `arping -I <iface> <gateway_ip>` (run on the kernel-networking control NIC).\n");
+        exit(1);
+    }
+#endif
     if (optind < argc) {
         config->target_range = strdup(argv[optind]);
     }
