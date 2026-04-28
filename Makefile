@@ -78,7 +78,7 @@ ifeq ($(USE_DPDK),1)
     endif
     CFLAGS  += $(DPDK_PKG_CFLAGS)
     LDFLAGS += $(DPDK_PKG_LIBS)
-    SRCS += src/send-dpdk.c src/recv-dpdk.c src/dpdk-eal.c src/eal-argv-split.c
+    SRCS += src/send-dpdk.c src/recv-dpdk.c src/dpdk-eal.c src/eal-argv-split.c src/dpdk-ring-clamp.c
 endif
 
 all: $(TARGET)

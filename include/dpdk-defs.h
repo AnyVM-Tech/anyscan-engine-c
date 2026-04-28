@@ -34,6 +34,16 @@
  *     queue). DPDK descriptors are smaller than AF_XDP UMEM frames so the
  *     ring depth can be lower for the same in-flight headroom.
  *
+ * Per-PMD ring-size caps observed in the wild:
+ *   - AWS ENA: tx_desc_lim.nb_max=512, nb_min=128, nb_align=1 (rx is the
+ *     same shape). The 1024 default exceeds the cap, so c6in.metal builds
+ *     MUST clamp before rte_eth_*queue_setup or the call returns
+ *     `Invalid value for nb_tx_desc(=1024)`. See dpdk_clamp_ring_size in
+ *     src/dpdk-ring-clamp.c — it consumes dev_info.{tx,rx}_desc_lim from
+ *     rte_eth_dev_info_get and produces a value the PMD will accept.
+ *   - i40e / ixgbe / mlx5: typically nb_max in the 4096..8192 range with
+ *     align=1; the 1024 default fits without clamping.
+ *
  * c6in.metal has 192 GiB RAM; mempool memory at 8192 × 8 senders ×
  * RTE_MBUF_DEFAULT_BUF_SIZE (~2 KiB) is ~128 MiB — negligible against the
  * 4 GiB hugepages reservation Phase 2 reserves.
@@ -42,6 +52,21 @@
 #define ANYSCAN_DPDK_RX_RING_SIZE         1024u
 #define ANYSCAN_DPDK_MBUFS_PER_SENDER     8192u
 #define ANYSCAN_DPDK_MEMPOOL_CACHE_SIZE   256u
+
+/* Clamp a requested TX/RX ring size against the device-reported limits in
+ * struct rte_eth_desc_lim (nb_max / nb_min / nb_align). Returns a value
+ * that satisfies all three of:
+ *   - value <= dev_max   (when dev_max != 0)
+ *   - value >= dev_min   (when dev_min != 0)
+ *   - value % dev_align == 0  (when dev_align > 1)
+ * A device limit reported as 0 means the PMD did not advertise that
+ * constraint and the corresponding check is skipped. Pure function — no
+ * libdpdk linkage required (defined in src/dpdk-ring-clamp.c). Unit
+ * coverage in tests/test_dpdk_clamp.c. */
+uint16_t dpdk_clamp_ring_size(uint16_t requested,
+                              uint16_t dev_max,
+                              uint16_t dev_min,
+                              uint16_t dev_align);
 
 /* Default port id when --dpdk-port is not specified. Port 0 is the
  * conventional first vfio-pci-bound device. */

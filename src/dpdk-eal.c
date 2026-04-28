@@ -188,6 +188,39 @@ int dpdk_eal_bringup(scanner_config_t *config, int eal_argc, char **eal_argv) {
         return -1;
     }
 
+    /* Clamp the requested TX/RX descriptor ring sizes against the
+     * device-reported per-port limits (struct rte_eth_desc_lim). Without
+     * this the AWS ENA PMD rejects the 1024-desc default with
+     * `Invalid value for nb_tx_desc(=1024), should be: <= 512` and
+     * rte_eth_tx_queue_setup fails — the c6in.metal bench regression in
+     * PR 65 issuecomment-4339242358. dpdk_clamp_ring_size is a pure
+     * function (src/dpdk-ring-clamp.c) covered by unit tests in
+     * tests/test_dpdk_clamp.c. */
+    uint16_t tx_ring_size = dpdk_clamp_ring_size(
+        ANYSCAN_DPDK_TX_RING_SIZE,
+        dev_info.tx_desc_lim.nb_max,
+        dev_info.tx_desc_lim.nb_min,
+        dev_info.tx_desc_lim.nb_align);
+    uint16_t rx_ring_size = dpdk_clamp_ring_size(
+        ANYSCAN_DPDK_RX_RING_SIZE,
+        dev_info.rx_desc_lim.nb_max,
+        dev_info.rx_desc_lim.nb_min,
+        dev_info.rx_desc_lim.nb_align);
+    if (!quiet_mode) {
+        if (tx_ring_size != ANYSCAN_DPDK_TX_RING_SIZE) {
+            printf("[*] dpdk-eal: port %u TX ring size clamped %u -> %u (PMD nb_max=%u nb_min=%u nb_align=%u)\n",
+                   port_id, ANYSCAN_DPDK_TX_RING_SIZE, tx_ring_size,
+                   dev_info.tx_desc_lim.nb_max, dev_info.tx_desc_lim.nb_min,
+                   dev_info.tx_desc_lim.nb_align);
+        }
+        if (rx_ring_size != ANYSCAN_DPDK_RX_RING_SIZE) {
+            printf("[*] dpdk-eal: port %u RX ring size clamped %u -> %u (PMD nb_max=%u nb_min=%u nb_align=%u)\n",
+                   port_id, ANYSCAN_DPDK_RX_RING_SIZE, rx_ring_size,
+                   dev_info.rx_desc_lim.nb_max, dev_info.rx_desc_lim.nb_min,
+                   dev_info.rx_desc_lim.nb_align);
+        }
+    }
+
     /* Mempool size: ANYSCAN_DPDK_MBUFS_PER_SENDER mbufs per sender thread,
      * with a small floor so a single-sender configuration still has enough
      * in-flight headroom for the TX burst plus completion drain. */
@@ -214,23 +247,23 @@ int dpdk_eal_bringup(scanner_config_t *config, int eal_argc, char **eal_argv) {
      * port_conf.txmode.offloads field has to match the device's offload set
      * exactly per DPDK's API contract — we left it 0, so this just works. */
     for (uint16_t q = 0; q < num_txq; q++) {
-        rc = rte_eth_tx_queue_setup(port_id, q, ANYSCAN_DPDK_TX_RING_SIZE,
+        rc = rte_eth_tx_queue_setup(port_id, q, tx_ring_size,
                                      rte_eth_dev_socket_id(port_id), NULL);
         if (rc < 0) {
-            fprintf(stderr, "[-] dpdk-eal: rte_eth_tx_queue_setup(port=%u, q=%u) failed: %s\n",
-                    port_id, q, strerror(-rc));
+            fprintf(stderr, "[-] dpdk-eal: rte_eth_tx_queue_setup(port=%u, q=%u, nb_tx_desc=%u) failed: %s\n",
+                    port_id, q, tx_ring_size, strerror(-rc));
             return -1;
         }
     }
 
     /* Configure each RX queue, sourced from the shared mempool. */
     for (uint16_t q = 0; q < num_rxq; q++) {
-        rc = rte_eth_rx_queue_setup(port_id, q, ANYSCAN_DPDK_RX_RING_SIZE,
+        rc = rte_eth_rx_queue_setup(port_id, q, rx_ring_size,
                                      rte_eth_dev_socket_id(port_id),
                                      NULL, g_dpdk_mbuf_pool);
         if (rc < 0) {
-            fprintf(stderr, "[-] dpdk-eal: rte_eth_rx_queue_setup(port=%u, q=%u) failed: %s\n",
-                    port_id, q, strerror(-rc));
+            fprintf(stderr, "[-] dpdk-eal: rte_eth_rx_queue_setup(port=%u, q=%u, nb_rx_desc=%u) failed: %s\n",
+                    port_id, q, rx_ring_size, strerror(-rc));
             return -1;
         }
     }
